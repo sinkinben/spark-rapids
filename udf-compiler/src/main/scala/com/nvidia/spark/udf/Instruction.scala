@@ -74,6 +74,26 @@ private[udf] object Repr {
     }
   }
 
+  // Internal representation of org.apache.spark.SparkException
+  case class SparkExcept(var message: Expression = Literal.default(StringType))
+      extends CompilerInternal("org.apache.spark.SparkException") {
+
+    def invoke(methodName: String, args: List[Expression]): (Expression, Boolean) = {
+      methodName match {
+        case "SparkException" =>
+          if (args.length > 1) {
+            throw new SparkException("Unsupported SparkException construction " +
+                                     "with multiple arguments")
+          } else {
+            message = args.head
+            (this, false)
+          }
+        case _ =>
+          throw new SparkException(s"Unsupported SparkException op ${methodName}")
+      }
+    }
+  }
+
   // Internal representation of the bytecode instruction getstatic.
   // This class is needed because we can't represent getstatic in Catalyst, but
   // we need the getstatic information to handle some method calls
@@ -233,6 +253,7 @@ case class Instruction(opcode: Int, operand: Int, instructionStr: String) extend
         const(state, (opcode - Opcode.ICONST_0).asInstanceOf[Int])
       case Opcode.LCONST_0 | Opcode.LCONST_1 =>
         const(state, (opcode - Opcode.LCONST_0).asInstanceOf[Long])
+      case Opcode.ATHROW => athrow(state)
       case Opcode.DADD | Opcode.FADD | Opcode.IADD | Opcode.LADD => binary(state, Add(_, _))
       case Opcode.DSUB | Opcode.FSUB | Opcode.ISUB | Opcode.LSUB => binary(state, Subtract(_, _))
       case Opcode.DMUL | Opcode.FMUL | Opcode.IMUL | Opcode.LMUL => binary(state, Multiply(_, _))
@@ -310,6 +331,11 @@ case class Instruction(opcode: Int, operand: Int, instructionStr: String) extend
     case _ => false
   }
 
+  def isThrow: Boolean = opcode match {
+    case Opcode.ATHROW => true
+    case _ => false
+  }
+
   //
   // Handle instructions
   //
@@ -321,6 +347,17 @@ case class Instruction(opcode: Int, operand: Int, instructionStr: String) extend
   private def store(state: State, localsIndex: Int): State = {
     val State(locals, top :: rest, cond, expr) = state
     State(locals.updated(localsIndex, top), rest, cond, expr)
+  }
+
+  private def athrow(state: State): State = {
+    val State(locals, top :: rest, cond, expr) = state
+    if (!top.isInstanceOf[Repr.SparkExcept]) {
+      throw new SparkException("Unsupported type for athrow")
+    }
+    // Empty the stack and convert the internal representation of
+    // org.apache.spark.SparkException object to RaiseError, then push it to the
+    // stack.
+    State(locals, List(RaiseError(top.asInstanceOf[Repr.SparkExcept].message)), cond, expr)
   }
 
   private def const(state: State, value: Any): State = {
@@ -360,6 +397,9 @@ case class Instruction(opcode: Int, operand: Int, instructionStr: String) extend
     if (typeName.equals("java.lang.StringBuilder")) {
       val State(locals, stack, cond, expr) = state
       State(locals, Repr.StringBuilder() :: stack, cond, expr)
+    } else if (typeName.equals("org.apache.spark.SparkException")) {
+      val State(locals, stack, cond, expr) = state
+      State(locals, Repr.SparkExcept() :: stack, cond, expr)
     } else if (typeName.equals("scala.collection.mutable.ArrayBuffer")) {
       val State(locals, stack, cond, expr) = state
       State(locals, Repr.ArrayBuffer() :: stack, cond, expr)
@@ -484,7 +524,31 @@ case class Instruction(opcode: Int, operand: Int, instructionStr: String) extend
       }
       val (retval, updateState) = args.head.asInstanceOf[Repr.StringBuilder]
           .invoke(method.getName, args.tail)
-      val newState = State(locals, retval :: rest, cond, expr)
+      val newState = {
+        if (method.getMethodInfo.isConstructor) {
+          State(locals, rest, cond, expr)
+        } else {
+          State(locals, retval :: rest, cond, expr)
+        }
+      }
+      if (updateState) {
+        newState.remap(args.head, retval)
+      } else {
+        newState
+      }
+    } else if (declaringClassName.equals("org.apache.spark.SparkException")) {
+      if (!args.head.isInstanceOf[Repr.SparkExcept]) {
+        throw new SparkException("Internal error with SparkException")
+      }
+      val (retval, updateState) = args.head.asInstanceOf[Repr.SparkExcept]
+          .invoke(method.getName, args.tail)
+      val newState = {
+        if (method.getMethodInfo.isConstructor) {
+          State(locals, rest, cond, expr)
+        } else {
+          State(locals, retval :: rest, cond, expr)
+        }
+      }
       if (updateState) {
         newState.remap(args.head, retval)
       } else {
