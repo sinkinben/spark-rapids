@@ -51,6 +51,7 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
+import org.apache.spark.sql.catalyst.util.RebaseDateTime
 import org.apache.spark.sql.connector.read.{InputPartition, PartitionReader, PartitionReaderFactory}
 import org.apache.spark.sql.execution.QueryExecutionException
 import org.apache.spark.sql.execution.datasources.{PartitionedFile, PartitioningAwareFileIndex}
@@ -200,6 +201,10 @@ object GpuOrcScan extends Arm {
     if (fromDt == toDt) {
       return col
     }
+    println("-----------")
+    println(fromDt.toString)
+    println(toDt.toString)
+    println("-----------")
     (fromDt, toDt) match {
       // integral to integral
       case (DType.BOOL8 | DType.INT8 | DType.INT16 | DType.INT32 | DType.INT64,
@@ -211,6 +216,28 @@ object GpuOrcScan extends Arm {
         } else {
           downCastAnyInteger(col, toDt)
         }
+
+      // 'date' type in ORC is actually 'DType.TIMESTAMP_DAYS'
+      // date -> timestamp
+      // 'col' is in Proleptic Gregorian calendar, we need to cast it into Julian calendar
+      case (DType.TIMESTAMP_DAYS, DType.TIMESTAMP_MICROSECONDS) =>
+        println(col.max().toString())
+        val gregorianToJulian = RebaseDateTime.rebaseGregorianToJulianDays(col.max().getInt)
+        val julianToGregorian = RebaseDateTime.rebaseJulianToGregorianDays(col.max().getInt)
+        printf("gregorianToJulian: %d \n", gregorianToJulian)
+        printf("julianToGregorian: %d \n", julianToGregorian)
+        withResource(col.castTo(DType.INT64)) { longVec =>
+          println(longVec.max().toString())
+          withResource(Scalar.fromLong(24 * 60 * 60 * 1000 * 1000L)) { toMicroSeconds =>
+            withResource(longVec.mul(toMicroSeconds)) { microSeconds =>
+              microSeconds.castTo(DType.TIMESTAMP_MICROSECONDS)
+            }
+          }
+        }
+      // date -> string
+      case (DType.TIMESTAMP_DAYS, DType.STRING) =>
+        col.asStrings()
+
       // TODO more types, tracked in https://github.com/NVIDIA/spark-rapids/issues/5895
       case (f, t) =>
         throw new QueryExecutionException(s"Unsupported type casting: $f -> $t")
@@ -239,6 +266,13 @@ object GpuOrcScan extends Arm {
         }
       case VARCHAR =>
         to.getCategory == STRING
+
+      case DATE =>
+        to.getCategory match {
+          case STRING | TIMESTAMP => true
+          case _ => false
+        }
+
       // TODO more types, tracked in https://github.com/NVIDIA/spark-rapids/issues/5895
       case _ =>
         false
